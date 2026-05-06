@@ -41,7 +41,7 @@ HOSTED = (os.environ.get("AUDIMO_HOSTED") or "").strip().lower() in ("1", "true"
 MANIFEST = {
     "id": "audimo-streamers",
     "name": "Audimo Streamers" + (" (hosted)" if HOSTED else ""),
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": (
         "Plays YouTube, SoundCloud, and Bandcamp as Audimo sources. "
         "Free public web streams, no account needed. Each service can "
@@ -488,30 +488,55 @@ async def cache_resolve(payload: dict, request: Request,
                         config: str = "") -> dict:
     """Re-extract a stored entry's stream URL.
 
-    Library entries this addon handed off carry the original page URL
-    (``source_url``) plus a ``kind``. We re-run the matching extractor
-    and return the standard ``{streamUrl, mimeType, source}`` envelope.
+    Library rows the SourcePicker writes for addon-resolved tracks
+    nest the addon's source under ``entry.source_payload`` and stamp
+    ``entry.type='addon'`` at the top level. So our `kind` (youtube /
+    soundcloud / bandcamp) and the original page URL live in
+    ``source_payload.{kind,link}``, NOT at the entry root.
+
+    We look there first, then fall back to top-level fields for older
+    library rows / hand-built entries.
     """
     entry = payload.get("entry") or {}
-    kind = ((entry.get("kind") or entry.get("type") or "")
-            .lower().strip())
-    page_url = ((entry.get("source_url") or entry.get("link") or
-                 entry.get("permalink") or entry.get("streamUrl") or "")
-                .strip())
+    sp = entry.get("source_payload") or {}
+
+    kind = ((sp.get("kind")
+             or entry.get("kind")
+             # entry.type is "addon" for SourcePicker-saved rows; only
+             # honour it as a kind hint for legacy non-addon entries.
+             or (entry.get("type") if entry.get("type") in ("youtube", "soundcloud", "bandcamp") else "")
+             or "").lower().strip())
+
+    page_url = ((sp.get("link") or sp.get("permalink") or sp.get("source_url")
+                 or entry.get("source_url") or entry.get("link")
+                 or entry.get("permalink")
+                 # streamUrl is the **expired** googlevideo URL for YT
+                 # rows — useless for re-extraction. Skip it. Bandcamp
+                 # / SoundCloud streamUrls are also expired by the time
+                 # cache.resolve runs.
+                 or "").strip())
+
     extract_fn = _extractor_for_kind(kind)
-    if not extract_fn or not page_url:
+    if not extract_fn:
         return {"error": "unresolvable",
-                "message": f"no extractor for kind={kind!r} or missing source_url"}
+                "message": f"no extractor for kind={kind!r}"}
+    if not page_url:
+        return {"error": "unresolvable",
+                "message": f"no source URL on entry (looked in source_payload.link, entry.link)"}
+
     result = await extract_fn(page_url)
     if not result:
         return {"error": "extract_failed"}
-    label = (entry.get("source") or kind).title()
+
+    # Don't .title() a label we already have — that lowercases
+    # "YouTube" to "Youtube". Only title-case the kind fallback.
+    label = sp.get("source") or entry.get("source") or kind.title()
     return {
         "streamUrl": result.get("stream_url", ""),
         "mimeType": result.get("mime_type", "audio/mpeg"),
         "source": label,
         "expires_at": result.get("expires_at"),
-        "albumCover": entry.get("albumCover"),
+        "albumCover": entry.get("albumCover") or sp.get("albumCover"),
         "filename": entry.get("filename", ""),
     }
 
