@@ -133,20 +133,48 @@ async def extract(watch_url: str) -> dict | None:
         print(f"[yt-extract] yt_dlp import failed: {e}", flush=True)
         return None
 
-    opts = {
+    base_opts = {
         "format": "bestaudio/best",
         "quiet": True,
         "no_warnings": True,
         "extract_flat": False,
         "noplaylist": True,
+        # yt-dlp defaults to deno only; node is more commonly available
+        "js_runtimes": {"node": {}, "bun": {}, "deno": {}},
     }
-    try:
-        info = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: yt_dlp.YoutubeDL(opts).extract_info(watch_url, download=False)
-        )
-    except Exception as e:
-        print(f"[yt-extract] failed for {watch_url}: {e}", flush=True)
-        return None
+
+    # Try extraction with cookies from each browser in order, then
+    # without cookies as a last resort (may fail on bot-gated regions).
+    _BROWSERS = ("chrome", "firefox", "safari", "edge")
+
+    async def _try_extract(opts: dict) -> dict | None:
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: yt_dlp.YoutubeDL(opts).extract_info(watch_url, download=False)
+            )
+        except Exception as e:
+            msg = str(e)
+            if "Sign in" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
+                return None  # signal: retry with different cookie source
+            print(f"[yt-extract] failed for {watch_url}: {e}", flush=True)
+            return False  # signal: real error, stop trying
+
+    info = None
+    for browser in _BROWSERS:
+        result = await _try_extract({**base_opts, "cookiesfrombrowser": (browser,)})
+        if result is False:
+            return None  # non-recoverable error
+        if result is not None:
+            info = result
+            break
+
+    if info is None:
+        # Last-ditch attempt with no cookies
+        result = await _try_extract(base_opts)
+        if not result:
+            print(f"[yt-extract] all cookie sources exhausted for {watch_url}", flush=True)
+            return None
+        info = result
     stream_url = info.get("url") or ""
     if not stream_url:
         return None
