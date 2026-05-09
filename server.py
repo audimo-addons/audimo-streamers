@@ -134,7 +134,13 @@ MANIFEST = {
 
 # ── App + middleware ────────────────────────────────────────────────
 
-app = FastAPI(title="audimo-streamers", version=MANIFEST["version"])
+app = FastAPI(
+    title="audimo-streamers",
+    version=MANIFEST["version"],
+    docs_url="/docs" if str(os.environ.get("AUDIMO_DEBUG", "")).lower() in {"1", "true", "yes"} else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if str(os.environ.get("AUDIMO_DEBUG", "")).lower() in {"1", "true", "yes"} else None,
+)
 
 # Browser-direct addon calls are first-class — the orchestrator runs
 # in the user's browser and talks to the addon directly. CORS = "*"
