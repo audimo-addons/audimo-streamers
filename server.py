@@ -41,7 +41,7 @@ HOSTED = (os.environ.get("AUDIMO_HOSTED") or "").strip().lower() in ("1", "true"
 MANIFEST = {
     "id": "audimo-streamers",
     "name": "Audimo Streamers" + (" (hosted)" if HOSTED else ""),
-    "version": "0.1.2",
+    "version": "0.3.1",
     "description": (
         "Plays YouTube, SoundCloud, and Bandcamp as Audimo sources. "
         "Free public web streams, no account needed. Each service can "
@@ -53,10 +53,24 @@ MANIFEST = {
         "resolve.stream",
         "cache.resolve",
         "search.tracks",
+        "ui.search",
+        "ui.home",
     ],
     "display": {
         "label": "Web streamers",
         "icon": "",
+    },
+    "ui": {
+        "search": {
+            "label": "Streaming",
+            "placeholder": "Search YouTube, SoundCloud, Bandcamp…",
+            "sort_priority": 50,
+        },
+        "home": {
+            "shelves": [
+                {"id": "popular_today", "label": "Popular today", "sort_priority": 60},
+            ],
+        },
     },
     "settings_schema": [
         {
@@ -146,9 +160,77 @@ app = FastAPI(
 # in the user's browser and talks to the addon directly. CORS = "*"
 # is required for the cross-origin GET of /manifest.json and the
 # POSTs that follow.
+# ── DNS-rebinding defense + tightened CORS ───────────────────────
+# Mirror of audimo-aio. See that file for the full rationale.
+import ipaddress as _ipaddress
+import re as _re
+
+_BIND_HOST = (
+    os.environ.get("AUDIMO_ADDON_HOST")
+    or os.environ.get("TUNNEL_ADDON_HOST")
+    or "127.0.0.1"
+).strip()
+_REMOTE_BIND = _BIND_HOST == "0.0.0.0"
+_TRUSTED_HOSTS_ENV = {
+    h.strip().lower()
+    for h in (os.environ.get("AUDIMO_ADDON_TRUSTED_HOSTS") or "").split(",")
+    if h.strip()
+}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_REMOTE_HOST_RE = _re.compile(
+    r"^([\w-]+\.)*(local|lan|home)$|^([\w-]+\.)*ts\.net$",
+    _re.IGNORECASE,
+)
+
+
+def _strip_host_port(host_header: str) -> str:
+    h = (host_header or "").strip()
+    if h.startswith("["):
+        idx = h.find("]")
+        return h[1:idx].lower() if idx > 0 else h.lower()
+    if ":" in h:
+        return h.split(":", 1)[0].lower()
+    return h.lower()
+
+
+def _host_allowed(host_header: str) -> bool:
+    h = _strip_host_port(host_header)
+    if not h:
+        return False
+    if h in _LOOPBACK_HOSTS or h in _TRUSTED_HOSTS_ENV:
+        return True
+    if not _REMOTE_BIND:
+        return False
+    try:
+        ip = _ipaddress.ip_address(h)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        pass
+    return bool(_REMOTE_HOST_RE.match(h))
+
+
+@app.middleware("http")
+async def _host_allowlist(request: Request, call_next):
+    if not _host_allowed(request.headers.get("host", "")):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Host not allowed"}, status_code=421)
+    return await call_next(request)
+
+
+_CORS_EXTRA = [
+    o.strip()
+    for o in (os.environ.get("AUDIMO_ADDON_CORS_EXTRA") or "").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=(
+        r"^(https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
+        r"|(tauri|app)://([\w-]+\.)?localhost"
+        r"|https?://([\w-]+\.)?(local|lan|home)(:\d+)?"
+        r"|https?://([\w-]+\.)*ts\.net(:\d+)?)$"
+    ),
+    allow_origins=_CORS_EXTRA,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -544,6 +626,144 @@ async def cache_resolve(payload: dict, request: Request,
         "expires_at": result.get("expires_at"),
         "albumCover": entry.get("albumCover") or sp.get("albumCover"),
         "filename": entry.get("filename", ""),
+    }
+
+
+# ── /ui/catalog + /ui/search — declarative tab (capability ui.tab) ──
+
+def _ui_item_from_source(s: dict) -> dict:
+    """Map an internal source dict (from extractor output) to a ui.tab
+    item card. on_select.type=="play" routes the row through Audimo's
+    SourcePicker, which calls our resolve.stream pipeline."""
+    title = s.get("title") or s.get("name") or ""
+    artist = s.get("artist") or ""
+    cover = s.get("albumCover") or ""
+    src_label = s.get("source") or s.get("kind") or ""
+    badges = []
+    if src_label:
+        badges.append(src_label.upper()[:8])
+    return {
+        "id": f"{s.get('kind','x')}:{s.get('link') or title}"[:120],
+        "title": title or s.get("name") or "—",
+        "subtitle": artist or src_label,
+        "image": cover if isinstance(cover, str) and cover.startswith("https://") else None,
+        "kind": "track",
+        "badges": badges,
+        "on_select": {
+            "type": "play",
+            "track": {"title": title, "artist": artist, "kind": "music"},
+        },
+    }
+
+
+@app.get("/ui/catalog")
+@app.get("/{config}/ui/catalog")
+async def ui_catalog(request: Request, config: str = "") -> dict:
+    """Static landing for the Streaming tab. The streamers addon has no
+    'trending' feed without API keys, so the catalog just explains what
+    the tab does and prompts the user to search."""
+    return {
+        "sections": [
+            {
+                "id": "intro",
+                "title": "Streaming",
+                "layout": "list",
+                "items": [
+                    {
+                        "id": "intro-1",
+                        "title": "Search to play from YouTube, SoundCloud, Bandcamp",
+                        "subtitle": "Free public streams — no account needed",
+                        "image": None,
+                        "kind": "track",
+                        "on_select": {"type": "noop"},
+                    },
+                ],
+            },
+        ],
+    }
+
+
+@app.post("/ui/search")
+@app.post("/{config}/ui/search")
+async def ui_search(payload: dict, request: Request, config: str = "") -> dict:
+    """Search the user's query across all enabled extractors and return
+    one section per source (YouTube / SoundCloud / Bandcamp) so the user
+    can scan results visually."""
+    q = (payload.get("q") or "").strip()
+    if not q:
+        return {"sections": []}
+    cfg = _config_from(request, payload)
+    extractors = _enabled_extractors(cfg)
+    if not extractors:
+        return {"sections": []}
+    limit = _int(cfg, "limit_per_source", 10)
+    results = await asyncio.gather(
+        *(search_fn(q, limit) for _, search_fn, _ in extractors),
+        return_exceptions=True,
+    )
+    sections: list[dict] = []
+    for (kind, _, _), res in zip(extractors, results):
+        if isinstance(res, BaseException) or not res:
+            continue
+        items = [_ui_item_from_source(s) for s in res]
+        if not items:
+            continue
+        sections.append({
+            "id": kind,
+            "title": kind.capitalize(),
+            "layout": "list",
+            "items": items,
+        })
+    return {"sections": sections}
+
+
+# ── /ui/home — addon-contributed shelves on the Home view ──────────
+
+# Curated seed list for the "Popular today" shelf. The streamers addon
+# has no real-time popularity feed without API keys, so we serve a
+# rotating set of evergreen tracks to demo the surface. A future
+# version could plug into a hot-100 RSS feed or addon-side cache.
+_POPULAR_TODAY_SEEDS = [
+    ("Bohemian Rhapsody", "Queen"),
+    ("Hotel California", "Eagles"),
+    ("Dreams", "Fleetwood Mac"),
+    ("Blinding Lights", "The Weeknd"),
+    ("Smells Like Teen Spirit", "Nirvana"),
+    ("Take On Me", "a-ha"),
+    ("Mr. Brightside", "The Killers"),
+    ("Don't Stop Believin'", "Journey"),
+]
+
+
+def _popular_today_items() -> list[dict]:
+    items = []
+    for title, artist in _POPULAR_TODAY_SEEDS:
+        items.append({
+            "id": f"pt:{title}:{artist}",
+            "title": title,
+            "subtitle": artist,
+            "image": None,
+            "kind": "track",
+            "on_select": {
+                "type": "play",
+                "track": {"title": title, "artist": artist, "kind": "music"},
+            },
+        })
+    return items
+
+
+@app.get("/ui/home")
+@app.get("/{config}/ui/home")
+async def ui_home(request: Request, config: str = "") -> dict:
+    return {
+        "shelves": [
+            {
+                "id": "popular_today",
+                "title": "Popular today",
+                "layout": "grid",
+                "items": _popular_today_items(),
+            },
+        ],
     }
 
 

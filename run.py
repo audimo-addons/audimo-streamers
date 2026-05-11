@@ -13,7 +13,13 @@ from server import app
 
 
 def main() -> None:
-    host = os.getenv("AUDIMO_STREAMERS_HOST") or os.getenv("AUDIMO_ADDON_HOST", "0.0.0.0")
+    # Default to 127.0.0.1; `0.0.0.0` requires an explicit opt-in.
+    host = (
+        os.getenv("AUDIMO_STREAMERS_HOST")
+        or os.getenv("AUDIMO_ADDON_HOST")
+        or os.getenv("TUNNEL_ADDON_HOST")
+        or "127.0.0.1"
+    )
     port = int(os.getenv("AUDIMO_STREAMERS_PORT") or os.getenv("AUDIMO_ADDON_PORT", "9006"))
     # access_log=False mirrors the other addons: addon URLs may carry
     # a config blob in path segments and we don't want to log those.

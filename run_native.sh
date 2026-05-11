@@ -15,10 +15,11 @@ if [[ ! -d .venv ]]; then
   .venv/bin/pip install --quiet -r requirements.txt
 fi
 
-echo "[run] starting audimo-streamers on http://0.0.0.0:9006"
+ADDON_HOST="${AUDIMO_ADDON_HOST:-${TUNNEL_ADDON_HOST:-127.0.0.1}}"
+echo "[run] starting audimo-streamers on http://${ADDON_HOST}:9006"
 
 exec .venv/bin/uvicorn server:app \
-  --host 0.0.0.0 \
+  --host "${ADDON_HOST}" \
   --port 9006 \
   --proxy-headers \
   --no-access-log \
