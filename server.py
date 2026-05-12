@@ -41,7 +41,7 @@ HOSTED = (os.environ.get("AUDIMO_HOSTED") or "").strip().lower() in ("1", "true"
 MANIFEST = {
     "id": "audimo-streamers",
     "name": "Audimo Streamers" + (" (hosted)" if HOSTED else ""),
-    "version": "0.3.1",
+    "version": "0.3.2",
     "description": (
         "Plays YouTube, SoundCloud, and Bandcamp as Audimo sources. "
         "Free public web streams, no account needed. Each service can "
