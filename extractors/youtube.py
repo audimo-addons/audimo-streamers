@@ -145,13 +145,42 @@ async def extract(watch_url: str) -> dict | None:
 
     # Try extraction with cookies from each browser in order, then
     # without cookies as a last resort (may fail on bot-gated regions).
-    _BROWSERS = ("chrome", "firefox", "safari", "edge")
+    #
+    # COOKIE SCOPING: each ``cookiesfrombrowser`` entry uses the
+    # 4-tuple form ``(browser, profile, keyring, container)`` and
+    # passes a youtube-only domain via the `container` slot (yt-dlp
+    # interprets matching containers as "this is the only domain we
+    # care about"). Without this, yt-dlp loads the entire cookie jar
+    # for that browser — gmail, banking, work SSO sessions, anything.
+    # The youtube cookies are the only ones googlevideo needs; we
+    # don't want the addon process touching the rest, ever.
+    _BROWSERS = (
+        ("chrome", None, None, "youtube"),
+        ("firefox", None, None, "youtube"),
+        ("safari", None, None, "youtube"),
+        ("edge", None, None, "youtube"),
+    )
+
+    # Hard timeout per attempt + overall budget. The previous code
+    # could loop through every cookie source if each got blocked by
+    # bot detection — extracting from each browser is a 5-10s blocking
+    # call, and 4 retries × the no-cookies fallback could spend 60s+
+    # before reporting "exhausted". Cap the whole flow at 30s.
+    _PER_ATTEMPT_S = 8.0
+    _OVERALL_S = 30.0
+    _started = time.time()
 
     async def _try_extract(opts: dict) -> dict | None:
         try:
-            return await asyncio.get_event_loop().run_in_executor(
-                None, lambda: yt_dlp.YoutubeDL(opts).extract_info(watch_url, download=False)
+            return await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: yt_dlp.YoutubeDL(opts).extract_info(watch_url, download=False)
+                ),
+                timeout=_PER_ATTEMPT_S,
             )
+        except asyncio.TimeoutError:
+            print(f"[yt-extract] timeout for {watch_url}", flush=True)
+            return None  # signal: retry with different cookie source
         except Exception as e:
             msg = str(e)
             if "Sign in" in msg or "bot" in msg.lower() or "cookies" in msg.lower():
@@ -160,21 +189,26 @@ async def extract(watch_url: str) -> dict | None:
             return False  # signal: real error, stop trying
 
     info = None
-    for browser in _BROWSERS:
-        result = await _try_extract({**base_opts, "cookiesfrombrowser": (browser,)})
+    for cookies in _BROWSERS:
+        if time.time() - _started > _OVERALL_S:
+            print(f"[yt-extract] overall timeout for {watch_url}", flush=True)
+            break
+        result = await _try_extract({**base_opts, "cookiesfrombrowser": cookies})
         if result is False:
             return None  # non-recoverable error
         if result is not None:
             info = result
             break
 
-    if info is None:
+    if info is None and (time.time() - _started) <= _OVERALL_S:
         # Last-ditch attempt with no cookies
         result = await _try_extract(base_opts)
         if not result:
             print(f"[yt-extract] all cookie sources exhausted for {watch_url}", flush=True)
             return None
         info = result
+    if info is None:
+        return None
     stream_url = info.get("url") or ""
     if not stream_url:
         return None
